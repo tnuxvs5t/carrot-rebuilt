@@ -1,9 +1,7 @@
 Carrot Rebuilt v2.2.0
 
 1. Disable or delete every older Carrot / Carrot Reliable userscript.
-2. Install carrot-rebuilt-v2.0.0.user.js in Tampermonkey.
+2. Install carrot-rebuilt-v2.2.0.user.js in Tampermonkey.
 3. Reload the Codeforces standings page.
-
-The script filename is kept for compatibility with existing download links; its @version is 2.2.0.
 
 This is a new script identity and uses @grant none. It deliberately does not access the old GM storage namespace.
