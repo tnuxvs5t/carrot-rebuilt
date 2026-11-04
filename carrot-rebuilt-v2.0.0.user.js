@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         Carrot Rebuilt
 // @namespace    https://tnuxdev.site/userscripts/carrot-rebuilt
-// @version      2.0.0
+// @version      2.2.0
 // @author       Yan233_ (original); reliability rewrite
-// @description  Codeforces rating performance and delta columns without GM storage or monolithic standings downloads.
+// @description  Codeforces live rating and performance prediction from current public standings; official final deltas, automatic refresh.
 // @license      AGPL-3.0-or-later
 // @match        https://codeforces.com/contest/*/standings*
 // @match        https://codeforces.com/gym/*/standings*
@@ -22,8 +22,10 @@
   const API_MAX_ATTEMPTS = 3;
   const API_LOCK_NAME = "carrot-rebuilt-codeforces-api";
   const API_RATE_STORAGE_KEY = "carrot-rebuilt.api.last-request-at";
-  const STATUS_PAGE_SIZE = 5000;
-  const WRONG_PENALTY_ICPC_MINUTES = 20;
+  const REFRESH_INTERVAL_MS = 60000;
+  const RATING_CACHE_MS = 5 * 60000;
+  const MAX_PENDING_RATING_AGE_SECONDS = 3 * 86400;
+  let ratingCache = null;
   let apiQueue = Promise.resolve();
   let localLastApiRequestAt = 0;
 
@@ -54,51 +56,48 @@
   async function fetchApiOnce(method, query) {
     const url = new URL(method, API_ROOT);
     for (const [key, value] of Object.entries(query)) {
-      if (value !== undefined) {
-        url.searchParams.set(key, String(value));
-      }
+      if (value !== undefined) url.searchParams.set(key, String(value));
     }
-
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
     let response;
     try {
       response = await fetch(url, {
         method: "GET",
+        // Public CF API methods are anonymous, even on a logged-in standings page.
         credentials: "omit",
         cache: "no-store",
         headers: { Accept: "application/json" },
         signal: controller.signal
       });
+      // Keep the deadline active until the response body has been consumed.
+      const payload = await response.json();
+      if (!response.ok || payload?.status !== "OK" || payload.result === undefined) {
+        const message = payload?.comment ?? ("Codeforces API request failed: " + method + " (HTTP " + response.status + ")");
+        const retryable = !isRatingChangesUnavailable(message) && (
+          [408, 425, 429].includes(response.status) || response.status >= 500 ||
+          /call limit exceeded|temporarily|try again|please wait|unavailable|internal error/i.test(message)
+        );
+        throw new ApiRequestError(message, retryable);
+      }
+      return payload.result;
     } catch (error) {
-      const timedOut = error instanceof DOMException && error.name === "AbortError";
-      throw new ApiRequestError(
-        `${timedOut ? "Timed out" : "Network failure"} while requesting ${method}`,
-        true,
-        { cause: error }
-      );
+      if (error instanceof ApiRequestError) throw error;
+      if (controller.signal.aborted || error?.name === "AbortError") {
+        throw new ApiRequestError("Timed out while requesting " + method, true, { cause: error });
+      }
+      if (error?.name === "SyntaxError") {
+        const status = response?.status;
+        throw new ApiRequestError(
+          "Non-JSON response from Codeforces API: " + method + " (HTTP " + status + "). Open Codeforces and complete any verification, then refresh.",
+          [408, 425, 429].includes(status) || status >= 500,
+          { cause: error }
+        );
+      }
+      throw new ApiRequestError("Network failure while requesting " + method, true, { cause: error });
     } finally {
       clearTimeout(timeout);
     }
-
-    let payload;
-    try {
-      payload = await response.json();
-    } catch (error) {
-      throw new ApiRequestError(
-        `Non-JSON response from Codeforces API: ${method} (HTTP ${response.status})`,
-        response.status === 429 || response.status >= 500,
-        { cause: error }
-      );
-    }
-
-    if (!response.ok || payload?.status !== "OK" || payload.result === undefined) {
-      const message = payload?.comment ?? `Codeforces API request failed: ${method} (HTTP ${response.status})`;
-      const retryable = response.status === 408 || response.status === 425 || response.status === 429 ||
-        response.status >= 500 || /call limit exceeded|temporarily|try again|please wait|unavailable|internal error/i.test(message);
-      throw new ApiRequestError(message, retryable);
-    }
-    return payload.result;
   }
 
   function scheduleApiRequest(task) {
@@ -111,7 +110,8 @@
     const execute = async () => {
       let sharedLastRequestAt = 0;
       try {
-        sharedLastRequestAt = Number(localStorage.getItem(API_RATE_STORAGE_KEY)) || 0;
+        const stored = Number(localStorage.getItem(API_RATE_STORAGE_KEY));
+        sharedLastRequestAt = Number.isFinite(stored) ? Math.min(Date.now(), Math.max(0, stored)) : 0;
       } catch {
         sharedLastRequestAt = 0;
       }
@@ -141,233 +141,46 @@
 
   function isRatingChangesUnavailable(error) {
     const message = error instanceof Error ? error.message : String(error);
-    return /rating changes.*unavailable|rating changes are unavailable|contest is not rated|not rated/i.test(message);
+    return /rating changes.*unavailable|contest is not rated|not rated|contest.*(?:has not finished|not finished|not over)/i.test(message);
   }
 
   async function fetchRatingChanges(contestId) {
     return await fetchApi("contest.ratingChanges", { contestId });
   }
 
-  async function fetchContest(contestId, gym) {
-    const contests = await fetchApi("contest.list", { gym: String(gym) });
-    const contest = contests.find((entry) => String(entry.id) === String(contestId));
-    if (!contest) {
-      throw new Error(`Contest ${contestId} not found`);
+  async function fetchContestStandings(contestId) {
+    // As of the 2026 public API, regular contests REQUIRE an anonymous GET with
+    // exactly one query parameter: contestId. Any extra parameter (including
+    // showUnofficial=false) rejects an otherwise valid standings request.
+    // Do not paginate: changing ranks between pages can create duplicates/gaps.
+    const standings = await fetchApi("contest.standings", { contestId });
+    if (!standings?.contest || !Array.isArray(standings.rows) ||
+        String(standings.contest.id) !== String(contestId)) {
+      throw new Error("Invalid contest standings response");
     }
-    return contest;
+    return standings;
   }
 
   async function fetchRatedUsers(contestId) {
-    const users = await fetchApi("user.ratedList", {
-      activeOnly: "false",
-      includeRetired: "false",
-      contestId
+    if (ratingCache?.contestId === contestId && Date.now() - ratingCache.fetchedAt < RATING_CACHE_MS) {
+      return ratingCache.users;
+    }
+    const result = await fetchApi("user.ratedList", {
+      activeOnly: "false", includeRetired: "true", contestId
     });
-    return users.map((user) => ({
-      handle: user.handle,
-      rating: Number.isInteger(user.rating) ? user.rating : null
-    }));
+    if (!Array.isArray(result)) throw new Error("Invalid rated users response");
+    const users = result
+      .filter((user) => typeof user?.handle === "string" && user.handle.length > 0)
+      .map((user) => ({
+        handle: user.handle,
+        rating: Number.isInteger(user.rating) ? user.rating : null
+      }));
+    ratingCache = { contestId, fetchedAt: Date.now(), users };
+    return users;
   }
 
-  async function fetchContestHacks(contestId) {
-    try {
-      return await fetchApi("contest.hacks", { contestId });
-    } catch (error) {
-      console.info(`${LOG_PREFIX} Hacks unavailable; continuing without hack adjustment.`, error);
-      return [];
-    }
-  }
-
-  function compareSubmissionKey(left, right) {
-    return left.time === right.time ? left.id - right.id : left.time - right.time;
-  }
-
-  function isDefinitiveWrongVerdict(verdict) {
-    return verdict !== undefined && verdict !== "OK" && verdict !== "COMPILATION_ERROR" &&
-      verdict !== "TESTING" && verdict !== "SUBMITTED";
-  }
-
-  function getPartyKey(party) {
-    if (party.participantId !== undefined) {
-      return String(party.participantId);
-    }
-    return party.members.map((member) => member.handle).slice().sort().join(",");
-  }
-
-  function createStandingsAccumulator(contest) {
-    const parties = new Map();
-    const states = new Map();
-    let officialSubmissionCount = 0;
-
-    function addSubmission(submission) {
-      const party = submission.author;
-      const relativeTimeSeconds = submission.relativeTimeSeconds;
-      if (!party || party.participantType !== "CONTESTANT" || party.ghost === true ||
-          !Number.isInteger(relativeTimeSeconds) || relativeTimeSeconds < 0 ||
-          relativeTimeSeconds > contest.durationSeconds) {
-        return;
-      }
-      const problemIndex = submission.problem?.index;
-      if (!problemIndex) {
-        return;
-      }
-
-      officialSubmissionCount += 1;
-      const partyKey = getPartyKey(party);
-      parties.set(partyKey, party);
-      const stateKey = `${partyKey}\u0000${problemIndex}`;
-      let state = states.get(stateKey);
-      if (!state) {
-        state = {
-          accepted: null,
-          wrongs: [],
-          maxPoints: Number(submission.problem?.points) || 0
-        };
-        states.set(stateKey, state);
-      }
-
-      const key = {
-        time: Number.isInteger(submission.creationTimeSeconds)
-          ? submission.creationTimeSeconds
-          : relativeTimeSeconds,
-        relativeTimeSeconds,
-        id: Number.isInteger(submission.id) ? submission.id : 0
-      };
-
-      if (submission.verdict === "OK") {
-        if (!state.accepted || compareSubmissionKey(key, state.accepted) < 0) {
-          state.accepted = key;
-        }
-      } else if (isDefinitiveWrongVerdict(submission.verdict)) {
-        state.wrongs.push(key);
-      }
-    }
-
-    function finish(hacks) {
-      const rowsByParty = new Map();
-      for (const [partyKey, party] of parties) {
-        rowsByParty.set(partyKey, { party, rank: 0, points: 0, penalty: 0 });
-      }
-
-      for (const [stateKey, state] of states) {
-        if (!state.accepted) {
-          continue;
-        }
-        const separator = stateKey.indexOf("\u0000");
-        const partyKey = stateKey.slice(0, separator);
-        const row = rowsByParty.get(partyKey);
-        if (!row) {
-          continue;
-        }
-        let wrongBeforeAccepted = 0;
-        for (const wrong of state.wrongs) {
-          if (compareSubmissionKey(wrong, state.accepted) < 0) {
-            wrongBeforeAccepted += 1;
-          }
-        }
-        const minute = Math.trunc(state.accepted.relativeTimeSeconds / 60);
-        if (contest.type === "ICPC") {
-          row.points += 1;
-          row.penalty += minute + WRONG_PENALTY_ICPC_MINUTES * wrongBeforeAccepted;
-        } else {
-          const durationMinutes = contest.durationSeconds / 60;
-          const timePenalty = Math.floor(120 * state.maxPoints * minute / (250 * durationMinutes));
-          row.points += Math.max(
-            0.3 * state.maxPoints,
-            state.maxPoints - timePenalty - 50 * wrongBeforeAccepted
-          );
-          row.penalty += minute;
-        }
-      }
-
-      const rows = Array.from(rowsByParty.values());
-      applyHackScores(hacks, rows);
-      rows.sort(compareRows);
-      assignStandingsRanks(rows);
-      return {
-        contest,
-        problems: [],
-        rows,
-        officialSubmissionCount
-      };
-    }
-
-    return { addSubmission, finish };
-  }
-
-  async function rebuildContestStandings(contest, onProgress) {
-    const accumulator = createStandingsAccumulator(contest);
-    let from = 1;
-    let pages = 0;
-    let fetchedSubmissions = 0;
-
-    for (;;) {
-      const page = await fetchApi("contest.status", {
-        contestId: contest.id,
-        from,
-        count: STATUS_PAGE_SIZE
-      });
-      pages += 1;
-      fetchedSubmissions += page.length;
-      for (const submission of page) {
-        accumulator.addSubmission(submission);
-      }
-      onProgress?.({ pages, fetchedSubmissions, pageSize: page.length });
-      if (page.length < STATUS_PAGE_SIZE) {
-        break;
-      }
-      from += STATUS_PAGE_SIZE;
-    }
-
-    const hacks = contest.type === "CF" ? await fetchContestHacks(contest.id) : [];
-    const standings = accumulator.finish(hacks);
-    return {
-      standings,
-      statusPages: pages,
-      submissions: fetchedSubmissions,
-      officialSubmissions: standings.officialSubmissionCount,
-      hacks: hacks.length
-    };
-  }
-
-  function applyHackScores(hacks, rows) {
-    const rowsByParty = new Map(rows.map((row) => [getPartyKey(row.party), row]));
-    for (const hack of hacks) {
-      const hacker = hack.hacker;
-      if (!hacker || hacker.participantType !== "CONTESTANT" || hacker.ghost === true) {
-        continue;
-      }
-      const key = getPartyKey(hacker);
-      let row = rowsByParty.get(key);
-      if (!row) {
-        row = { party: hacker, rank: 0, points: 0, penalty: 0 };
-        rows.push(row);
-        rowsByParty.set(key, row);
-      }
-      if (hack.verdict === "HACK_SUCCESSFUL") {
-        row.points += 100;
-      } else if (hack.verdict === "HACK_UNSUCCESSFUL") {
-        row.points -= 50;
-      }
-    }
-  }
-
-  function compareRows(left, right) {
-    return left.points === right.points ? left.penalty - right.penalty : right.points - left.points;
-  }
-
-  function assignStandingsRanks(rows) {
-    let rank = 0;
-    let previousPoints = null;
-    let previousPenalty = null;
-    for (const [index, row] of rows.entries()) {
-      if (row.points !== previousPoints || row.penalty !== previousPenalty) {
-        rank = index + 1;
-        previousPoints = row.points;
-        previousPenalty = row.penalty;
-      }
-      row.rank = rank;
-    }
+  function normalizeHandle(handle) {
+    return String(handle).trim().toLowerCase();
   }
 
   const STANDINGS_PATH_PATTERN = /^\/(contest|gym)\/(\d+)\/standings(?:\/.*)?$/;
@@ -500,11 +313,22 @@
   );
   const convolution = new RealConvolution(winProbability.length + RATING_SPAN - 1);
   function predictDeltas(entries, ranksAreFixed = false) {
+    if (entries.length === 0) return [];
     const contestants = entries.map(toMutableContestant);
-    const seeds = buildSeeds(contestants);
-    if (!ranksAreFixed) {
-      assignRanks(contestants);
+    const handles = new Set();
+    for (const contestant of contestants) {
+      if (!contestant.handle || handles.has(contestant.handle)) throw new Error("Duplicate or missing contestant handle");
+      handles.add(contestant.handle);
+      if (!Number.isInteger(contestant.effectiveRating) || contestant.effectiveRating < MIN_RATING || contestant.effectiveRating >= MAX_RATING) {
+        throw new Error("Contestant rating outside supported calculation range");
+      }
+      if (ranksAreFixed ? contestant.rank < 1 : !Number.isFinite(contestant.points) || !Number.isFinite(contestant.penalty)) {
+        throw new Error("Invalid contestant score or rank");
+      }
     }
+    const seeds = buildSeeds(contestants);
+    if (ranksAreFixed) assignPublishedRanks(contestants);
+    else assignRanks(contestants);
     calculate(contestants, seeds);
     return toPredictions(contestants);
   }
@@ -528,6 +352,7 @@
   function toMutableContestant(entry) {
     return {
       ...entry,
+      handle: normalizeHandle(entry.handle ?? ""),
       effectiveRating: entry.rating ?? DEFAULT_RATING,
       rank: Number.isInteger(entry.rank) && entry.rank > 0 ? entry.rank : 0,
       delta: 0,
@@ -549,19 +374,33 @@
     return seeds[rating + WIN_PROBABILITY_OFFSET + RATING_INDEX_OFFSET] - winProbability[rating - excludedRating + WIN_PROBABILITY_OFFSET];
   }
   function assignRanks(contestants) {
-    contestants.sort(
-      (left, right) => left.points === right.points ? left.penalty - right.penalty : right.points - left.points
-    );
+    contestants.sort((left, right) =>
+      left.points === right.points ? left.penalty - right.penalty : right.points - left.points);
+    // The rating algorithm uses the last place in a tied group, not the first.
     let rank = 0;
-    let previousPoints = null;
-    let previousPenalty = null;
-    for (const [index, contestant] of contestants.entries()) {
+    let previousPoints;
+    let previousPenalty;
+    for (let index = contestants.length - 1; index >= 0; index -= 1) {
+      const contestant = contestants[index];
       if (contestant.points !== previousPoints || contestant.penalty !== previousPenalty) {
         rank = index + 1;
         previousPoints = contestant.points;
         previousPenalty = contestant.penalty;
       }
       contestant.rank = rank;
+    }
+  }
+  function assignPublishedRanks(contestants) {
+    contestants.sort((left, right) => left.rank - right.rank);
+    let previousRank;
+    let rank = 0;
+    for (let index = contestants.length - 1; index >= 0; index -= 1) {
+      const publishedRank = contestants[index].rank;
+      if (publishedRank !== previousRank) {
+        rank = index + 1;
+        previousRank = publishedRank;
+      }
+      contestants[index].rank = rank;
     }
   }
   function calculateDelta(contestant, assumedRating, seeds) {
@@ -589,21 +428,38 @@
     return primaryAdjustment + leaderAdjustment;
   }
   function calculatePerformance(contestant, seeds, adjustment) {
-    if (contestant.rank === 1) {
-      return Infinity;
-    }
-    return lowerBoundInt(
+    // The highest unique place has no finite break-even performance rating.
+    if (contestant.rank === 1) return Infinity;
+    const result = lowerBoundInt(
       MIN_RATING,
       MAX_RATING,
       (assumedRating) => calculateDelta(contestant, assumedRating, seeds) + adjustment <= 0
     );
+    // Reaching MAX_RATING means our bounded inversion did not find a root.
+    // Do not incorrectly label that case as an exact 6000 performance.
+    return result === MAX_RATING ? null : result;
   }
   const EDUCATIONAL_RATED_THRESHOLD = 2100;
+  // These are common rating ceilings, not a substitute for contest-specific
+  // eligibility/anti-cheat rules. Only apply them for unambiguous round names.
+  function getRatedRatingCeiling(contestName) {
+    const name = contestName.toLowerCase();
+    const divisions = [...name.matchAll(/div(?:ision)?\.?\s*([1-4])\b/g)]
+      .map((match) => Number(match[1]));
+    if (name.includes("educational")) return EDUCATIONAL_RATED_THRESHOLD;
+    if (new Set(divisions).size !== 1) return null;
+    switch (divisions[0]) {
+      case 2: return 2100;
+      case 3: return 1600;
+      case 4: return 1400;
+      default: return null;
+    }
+  }
   const UNRATED_CONTEST_NAME_HINTS = ["unrated", "fools", "q#", "kotlin", "marathon", "teams"];
   const FAKE_RATINGS_SINCE_CONTEST = 1360;
   const NEW_DEFAULT_RATING = 1400;
   function predictFromCodeforces(standings, ratedUsers) {
-    const ratings = new Map(ratedUsers.map((user) => [user.handle, user.rating]));
+    const ratings = new Map(ratedUsers.map((user) => [normalizeHandle(user.handle), user.rating]));
     const entries = getPredictionEntries(standings, ratings);
     return predictDeltas(entries);
   }
@@ -618,10 +474,18 @@
     return predictDeltas(entries, true);
   }
   function getPredictionSkipReason(standings) {
+    if (!["CF", "ICPC"].includes(standings.contest.type)) return "unsupported-contest-type";
+    if (standings.contest.frozen) return "standings-frozen";
+    const contestEnd = standings.contest.startTimeSeconds + standings.contest.durationSeconds;
+    if (standings.contest.phase === "FINISHED" && Date.now() / 1000 - contestEnd > MAX_PENDING_RATING_AGE_SECONDS) {
+      return "published-rating-unavailable-for-old-contest";
+    }
     if (isUnratedByName(standings.contest.name)) {
       return "contest-name-unrated";
     }
-    if (standings.rows.some((row) => row.party.teamId !== void 0 || row.party.teamName !== void 0)) {
+    if (standings.rows.length && standings.rows.every((row) =>
+      row.party?.teamId !== undefined || row.party?.teamName !== undefined ||
+      (row.party?.members?.length ?? 0) !== 1)) {
       return "team-contest";
     }
     if (!standings.rows.some((row) => row.party.participantType === "CONTESTANT")) {
@@ -629,27 +493,33 @@
     }
     return null;
   }
-  function getPredictionEntries(standings, ratings, options) {
-    const isEducational = isEducationalRound(standings.contest.name);
-    return standings.rows.filter((row) => row.party.participantType === "CONTESTANT").filter((row) => row.party.teamId === void 0 && row.party.teamName === void 0).map((row) => {
-      const handle = row.party.members[0]?.handle;
-      if (!handle) {
-        return null;
+  function getPredictionEntries(standings, ratings) {
+    const ceiling = getRatedRatingCeiling(standings.contest.name);
+    const contestId = Number(standings.contest.id);
+    const seen = new Set();
+    const entries = [];
+    for (const row of standings.rows) {
+      const party = row.party;
+      if (party?.participantType !== "CONTESTANT" || party.ghost ||
+          party.teamId !== undefined || party.teamName !== undefined ||
+          party.members?.length !== 1) continue;
+      const handle = party.members[0]?.handle;
+      if (typeof handle !== "string" || !handle) continue;
+      const normalized = normalizeHandle(handle);
+      if (seen.has(normalized)) {
+        throw new Error("Duplicate contestant in official standings: " + handle);
       }
-      const rating = ratings.get(handle) ?? null;
-      if (isEducational && rating !== null && rating >= EDUCATIONAL_RATED_THRESHOLD) {
-        return null;
-      }
-      return {
-        handle,
-        points: row.points,
-        penalty: row.penalty,
-        rating
-      };
-    }).filter((entry) => entry !== null);
-  }
-  function isEducationalRound(contestName) {
-    return contestName.toLowerCase().includes("educational");
+      seen.add(normalized);
+      const previousRating = ratings.get(normalized) ?? null;
+      // New accounts can appear as rating=0 before a first rated round.
+      // Since CF contest #1360, their effective initial rating is 1400.
+      const rating = contestId >= FAKE_RATINGS_SINCE_CONTEST && previousRating === 0
+        ? null : previousRating;
+      if (ceiling !== null && (rating ?? DEFAULT_RATING) >= ceiling) continue;
+      if (!Number.isFinite(row.points) || !Number.isFinite(row.penalty)) continue;
+      entries.push({ handle, points: row.points, penalty: row.penalty, rating });
+    }
+    return entries;
   }
   function isUnratedByName(contestName) {
     const lowerName = contestName.toLowerCase();
@@ -700,14 +570,14 @@
     if (!table) {
       return null;
     }
-    const rows = Array.from(table.querySelectorAll("tbody tr"));
+    const rows = Array.from(table.rows).filter((row) => row.closest("table") === table);
     if (rows.length === 0) {
       return null;
     }
     return { table, rows };
   }
   function addFinalRatingColumns(standings, finalResults) {
-    return addRatingColumns(standings, "Final performance", "Final rating change", "Rank change", FINAL_HEADER_CLASS, {
+    return addRatingColumns(standings, "Estimated performance from published rating ranks", "Official final rating change", "Official rank change", FINAL_HEADER_CLASS, {
       performance: (cell, row, isFooterRow) => renderFinalPerformanceCell(cell, row, finalResults, isFooterRow),
       delta: (cell, row, isFooterRow) => renderFinalDeltaCell(cell, row, finalResults, isFooterRow),
       rank: (cell, row, isFooterRow) => renderFinalRankCell(cell, row, finalResults, isFooterRow)
@@ -735,7 +605,7 @@
   }
   function addPredictedRatingColumns(standings, predictions) {
     const predictionMap = predictions ? new Map(predictions.map((prediction) => [prediction.handle, prediction])) : null;
-    return addRatingColumns(standings, "Predicted performance", "Predicted rating change", "Rating change for rank up", PREDICTED_HEADER_CLASS, {
+    return addRatingColumns(standings, "Estimated performance (break-even rating, live standings)", "Estimated rating change if the contest is rated", "Rating change required for rank up", PREDICTED_HEADER_CLASS, {
       performance: (cell, row, isFooterRow) => renderPredictedPerformanceCell(cell, row, predictionMap, isFooterRow),
       delta: (cell, row, isFooterRow) => renderPredictedDeltaCell(cell, row, predictionMap, isFooterRow),
       rank: (cell, row, isFooterRow) => renderPredictedRankCell(cell, row, predictionMap, isFooterRow)
@@ -745,14 +615,16 @@
     let dataRows = 0;
     let matchedRows = 0;
     for (const [index, row] of standings.rows.entries()) {
+      const isContestantRow = Boolean(row.querySelector("td.contestant-cell"));
+      const isHeaderRow = !isContestantRow && (index === 0 || Boolean(row.querySelector("th")));
       row.querySelector("th:last-child, td:last-child")?.classList.remove("right");
-      const performanceCell = document.createElement(index === 0 ? "th" : "td");
-      const deltaCell = document.createElement(index === 0 ? "th" : "td");
-      const rankCell = document.createElement(index === 0 ? "th" : "td");
+      const performanceCell = document.createElement(isHeaderRow ? "th" : "td");
+      const deltaCell = document.createElement(isHeaderRow ? "th" : "td");
+      const rankCell = document.createElement(isHeaderRow ? "th" : "td");
       performanceCell.classList.add(CELL_CLASS, PERFORMANCE_CELL_CLASS);
       deltaCell.classList.add(CELL_CLASS, DELTA_CELL_CLASS);
       rankCell.classList.add(CELL_CLASS, RANK_CELL_CLASS);
-      if (index === 0) {
+      if (isHeaderRow) {
         performanceCell.classList.add("top", HEADER_CLASS, headerClass);
         performanceCell.title = performanceTitle;
         performanceCell.textContent = "Π";
@@ -769,7 +641,7 @@
           deltaCell.classList.add("dark");
           rankCell.classList.add("dark");
         }
-        const isFooterRow = index === standings.rows.length - 1;
+        const isFooterRow = !isContestantRow;
         if (!isFooterRow) {
           dataRows += 1;
         }
@@ -807,9 +679,9 @@
     }
     const handle = getHandle(row);
     const performance2 = handle && finalResults?.get(handle)?.performance;
-    if (typeof performance2 !== "number") {
+    if (!Number.isFinite(performance2) && performance2 !== Infinity) {
       cell.textContent = "N/A";
-      cell.title = finalResults ? "No performance found for this row" : "Performance unavailable";
+      cell.title = finalResults ? "No bounded performance estimate found for this row" : "Performance unavailable";
       cell.classList.add("carrot-rebuilt-muted");
       return false;
     }
@@ -864,7 +736,7 @@
     }
     const handle = getHandle(row);
     const prediction = handle ? predictions?.get(handle) : void 0;
-    if (!prediction) {
+    if (!prediction || (prediction.performance !== Infinity && !Number.isFinite(prediction.performance))) {
       cell.textContent = "N/A";
       cell.title = predictions ? "No prediction found for this row" : "Prediction unavailable";
       cell.classList.add("carrot-rebuilt-muted");
@@ -906,6 +778,9 @@
   }
   function renderPerformance(cell, performance2) {
     cell.textContent = performance2 === Infinity ? "∞" : String(performance2);
+    cell.title = performance2 === Infinity
+      ? "Unbounded first-place performance (conventional Carrot definition)"
+      : "Estimated break-even performance rating (zero predicted rating change)";
     cell.classList.add("carrot-rebuilt-performance");
     const colorClass = performance2 === Infinity ? null : getRank(performance2).colorClass;
     if (colorClass) {
@@ -950,7 +825,13 @@
   function getHandle(row) {
     const contestantCell = row.querySelector("td.contestant-cell");
     const profileLink = contestantCell?.querySelector('a[href*="/profile/"]');
-    return profileLink?.textContent?.trim() || null;
+    // The URL is stable even if Codeforces decorates the visible handle.
+    const href = profileLink?.getAttribute("href");
+    const match = href && /\/profile\/([^/?#]+)/.exec(href);
+    if (match) {
+      try { return normalizeHandle(decodeURIComponent(match[1])); } catch { /* fall back to visible text */ }
+    }
+    return profileLink?.textContent?.trim() ? normalizeHandle(profileLink.textContent) : null;
   }
   const PANEL_CLASS = "carrot-rebuilt-cache-panel";
   const STATUS_CLASS = "carrot-rebuilt-cache-status";
@@ -958,7 +839,7 @@
   const MISS_CLASS = "carrot-rebuilt-cache-miss";
   const LIVE_CLASS = "carrot-rebuilt-cache-live";
 
-  function addStatusPanel(table) {
+  function addStatusPanel(table, refresh) {
     document.querySelector(`.${PANEL_CLASS}`)?.remove();
     const panel = document.createElement("div");
     panel.classList.add(PANEL_CLASS);
@@ -971,8 +852,16 @@
     status.classList.add(STATUS_CLASS, LIVE_CLASS);
     panel.append(status);
 
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = "Refresh";
+    button.classList.add("carrot-rebuilt-cache-clear");
+    button.addEventListener("click", refresh);
+    panel.append(button);
     table.parentElement?.append(panel);
     return {
+      element: panel,
+      setBusy(busy) { button.disabled = busy; },
       set(text, tone = "live") {
         status.textContent = text;
         status.classList.remove(HIT_CLASS, MISS_CLASS, LIVE_CLASS);
@@ -1130,133 +1019,196 @@ tr.highlighted-row .carrot-rebuilt-rank-up-achieved {
     document2.head.append(style);
   }
   async function buildFinalResults(contestId, ratingChanges) {
-    const performanceByHandle = new Map(
-      calculateFinalPerformanceFromRatingChanges(Number(contestId), ratingChanges)
-        .map((prediction) => [prediction.handle, prediction.performance])
-    );
-    return new Map(
-      ratingChanges.map((change) => [
-        change.handle,
-        {
-          delta: change.newRating - change.oldRating,
-          oldRating: change.oldRating,
-          newRating: change.newRating,
-          performance: performanceByHandle.get(change.handle)
-        }
-      ])
-    );
+    let performanceByHandle = new Map();
+    let performanceError = null;
+    try {
+      performanceByHandle = new Map(
+        calculateFinalPerformanceFromRatingChanges(Number(contestId), ratingChanges)
+          .map((prediction) => [normalizeHandle(prediction.handle), prediction.performance])
+      );
+    } catch (error) {
+      // An estimate failing must not hide the official rating changes.
+      performanceError = error;
+      console.warn(LOG_PREFIX, "Performance estimation failed", error);
+    }
+    const results = new Map(ratingChanges.map((change) => [normalizeHandle(change.handle), {
+      delta: change.newRating - change.oldRating,
+      oldRating: change.oldRating,
+      newRating: change.newRating,
+      performance: performanceByHandle.get(normalizeHandle(change.handle))
+    }]));
+    return { results, performanceError };
   }
 
-  async function tryRenderFinalResults(page, standings, panel, startedAt) {
-    if (page.gym) {
-      return false;
-    }
-    panel.set("checking published rating changes");
+  async function loadView(page, setStatus) {
+    if (page.gym) return { kind: "skipped", message: "gym contests are not Codeforces-rated" };
+    setStatus("checking published rating changes");
     let changes;
     try {
       changes = await fetchRatingChanges(page.contestId);
     } catch (error) {
-      if (isRatingChangesUnavailable(error)) {
-        return false;
+      // Only an explicit absence of rating changes allows prediction fallback.
+      if (!isRatingChangesUnavailable(error)) throw error;
+    }
+    if (changes !== undefined && !Array.isArray(changes)) throw new Error("Invalid rating changes response");
+    if (changes?.length) {
+      if (changes.some((change) => !change.handle || !Number.isInteger(change.oldRating) ||
+          !Number.isInteger(change.newRating) || !Number.isInteger(change.rank) || change.rank < 1)) {
+        throw new Error("Invalid published rating change");
       }
-      console.info(`${LOG_PREFIX} Rating changes unavailable; trying live reconstruction.`, error);
-      return false;
+      setStatus("computing performance for " + changes.length + " rated users");
+      const { results, performanceError } = await buildFinalResults(page.contestId, changes);
+      return { kind: "final", results, performanceError, fetchedAt: Date.now() };
     }
-    if (!Array.isArray(changes) || changes.length === 0) {
-      return false;
-    }
-
-    panel.set(`computing final performance for ${changes.length} rated users`);
-    const finalResults = await buildFinalResults(page.contestId, changes);
-    clearCarrotColumns(standings);
-    const stats = addFinalRatingColumns(standings, finalResults);
-    panel.set(`final: ${stats.matchedRows}/${stats.dataRows} rows`, "ok");
-    console.info(`${LOG_PREFIX} final`, {
-      contestId: page.contestId,
-      changes: changes.length,
-      rendered: `${stats.matchedRows}/${stats.dataRows}`,
-      totalMs: Math.round(performance.now() - startedAt)
-    });
-    return true;
+    setStatus("loading official standings");
+    const standings = await fetchContestStandings(page.contestId);
+    const skipReason = getPredictionSkipReason(standings);
+    if (skipReason) return {
+      kind: "skipped", message: "prediction skipped: " + skipReason,
+      refreshable: ["no-contestants", "standings-frozen"].includes(skipReason)
+    };
+    setStatus("loading contestant ratings");
+    const users = await fetchRatedUsers(page.contestId);
+    const predictions = predictFromCodeforces(standings, users);
+    if (predictions.length === 0) return { kind: "skipped", message: "no eligible contestants", refreshable: true };
+    return { kind: "predicted", predictions, fetchedAt: Date.now() };
   }
 
-  async function renderPrediction(page, standings, panel, startedAt) {
-    if (page.gym) {
-      clearCarrotColumns(standings);
-      panel.set("gym contests are not Codeforces-rated", "error");
-      return;
-    }
-
-    panel.set("loading contest metadata");
-    const contest = await fetchContest(page.contestId, false);
-    if (isUnratedByName(contest.name)) {
-      clearCarrotColumns(standings);
-      panel.set("contest appears unrated", "error");
-      return;
-    }
-
-    panel.set("rebuilding standings from paged submissions");
-    const rebuilt = await rebuildContestStandings(contest, ({ pages, fetchedSubmissions }) => {
-      panel.set(`status pages: ${pages}; submissions: ${fetchedSubmissions}`);
-    });
-
-    const skipReason = getPredictionSkipReason(rebuilt.standings);
-    if (skipReason) {
-      clearCarrotColumns(standings);
-      panel.set(`prediction skipped: ${skipReason}`, "error");
-      return;
-    }
-
-    panel.set("loading contestant ratings");
-    const ratedUsers = await fetchRatedUsers(page.contestId);
-    panel.set(`computing prediction for ${rebuilt.standings.rows.length} contestants`);
-    const predictions = predictFromCodeforces(rebuilt.standings, ratedUsers);
-    clearCarrotColumns(standings);
-    const stats = addPredictedRatingColumns(standings, predictions);
-    panel.set(`predicted: ${stats.matchedRows}/${stats.dataRows} rows`, "ok");
-    console.info(`${LOG_PREFIX} prediction`, {
-      contestId: page.contestId,
-      rows: rebuilt.standings.rows.length,
-      statusPages: rebuilt.statusPages,
-      submissions: rebuilt.submissions,
-      officialSubmissions: rebuilt.officialSubmissions,
-      hacks: rebuilt.hacks,
-      ratedUsers: ratedUsers.length,
-      rendered: `${stats.matchedRows}/${stats.dataRows}`,
-      totalMs: Math.round(performance.now() - startedAt)
-    });
-  }
-
-  async function main() {
-    const startedAt = performance.now();
+  function start() {
     const page = getStandingsPage(window.location);
-    if (!page) {
-      return;
-    }
-    const standings = findStandingsTable(document);
-    if (!standings) {
-      console.info(`${LOG_PREFIX} Standings table not found.`);
-      return;
-    }
-
+    if (!page) return;
     installStandingsStyles(document);
-    clearCarrotColumns(standings);
-    addLoadingColumn(standings);
-    const panel = addStatusPanel(standings.table);
+    let standings = null;
+    let handles = [];
+    let panel = null;
+    let view = null;
+    let busy = false;
+    let timer = null;
+    let scheduledMount = null;
+    let stopped = false;
+    let statusText = "waiting for standings";
+    let statusTone = "live";
 
-    try {
-      if (await tryRenderFinalResults(page, standings, panel, startedAt)) {
+    function setStatus(text, tone = "live") {
+      statusText = text;
+      statusTone = tone;
+      panel?.set(text, tone);
+    }
+    function render() {
+      if (!standings?.table.isConnected) return null;
+      clearCarrotColumns(standings);
+      if (view?.kind === "final") return addFinalRatingColumns(standings, view.results);
+      if (view?.kind === "predicted") return addPredictedRatingColumns(standings, view.predictions);
+      if (view?.kind === "skipped") return null;
+      if (view?.kind === "error") return addPredictedRatingColumns(standings, null);
+      return addLoadingColumn(standings);
+    }
+    function describeView(stats) {
+      if (view.kind === "skipped") return setStatus(view.message, "error");
+      const time = new Date(view.fetchedAt).toLocaleTimeString();
+      const coverage = stats ? stats.matchedRows + "/" + stats.dataRows + " rows" : "table unavailable";
+      if (view.kind === "final") {
+        setStatus("final Δ; " + (view.performanceError ? "performance unavailable" : "estimated Π") + "; " + coverage + "; " + time,
+          view.performanceError ? "error" : "ok");
+      } else {
+        setStatus("live predicted Π/Δ (unofficial); " + coverage + "; " + time);
+      }
+    }
+    function scheduleRefresh() {
+      clearTimeout(timer);
+      timer = null;
+      if (!stopped && !document.hidden && view?.kind !== "final" &&
+          !(view?.kind === "skipped" && !view.refreshable) && !page.gym) {
+        timer = setTimeout(() => { void refresh(); }, REFRESH_INTERVAL_MS);
+      }
+    }
+    async function refresh(manual = false) {
+      if (stopped || busy || !standings || (!manual && document.hidden)) return;
+      clearTimeout(timer);
+      busy = true;
+      panel?.setBusy(true);
+      if (manual) ratingCache = null;
+      try {
+        const nextView = await loadView(page, setStatus);
+        if (stopped) return;
+        view = nextView;
+        describeView(render());
+      } catch (error) {
+        if (stopped) return;
+        console.error(LOG_PREFIX, error);
+        const hasPrevious = view?.kind === "final" || view?.kind === "predicted";
+        const previousTime = hasPrevious ? new Date(view.fetchedAt).toLocaleTimeString() : "";
+        if (!hasPrevious) { view = { kind: "error" }; render(); }
+        setStatus((hasPrevious ? "stale results from " + previousTime + "; " : "") + (error instanceof Error ? error.message : String(error)), "error");
+      } finally {
+        busy = false;
+        panel?.setBusy(false);
+        scheduleRefresh();
+      }
+    }
+    function mount() {
+      if (stopped) return;
+      const currentPage = getStandingsPage(window.location);
+      if (!currentPage || currentPage.contestId !== page.contestId || currentPage.gym !== page.gym) {
+        stop();
         return;
       }
-      await renderPrediction(page, standings, panel, startedAt);
-    } catch (error) {
-      console.error(`${LOG_PREFIX} failed`, error);
-      clearCarrotColumns(standings);
-      addPredictedRatingColumns(standings, null);
-      panel.set(error instanceof Error ? error.message : String(error), "error");
+      const next = findStandingsTable(document);
+      if (!next) return;
+      const nextHandles = next.rows.map(getHandle);
+      const changed = !standings || standings.table !== next.table ||
+        standings.rows.length !== next.rows.length ||
+        next.rows.some((row, index) => row !== standings.rows[index] || nextHandles[index] !== handles[index]) ||
+        next.rows.some((row) => row.querySelector("td.contestant-cell") && view?.kind !== "skipped" &&
+          !row.querySelector("." + PERFORMANCE_CELL_CLASS));
+      const firstMount = standings === null;
+      standings = next;
+      handles = nextHandles;
+      if (!panel?.element.isConnected) {
+        panel = addStatusPanel(next.table, () => { void refresh(true); });
+        panel.set(statusText, statusTone);
+        panel.setBusy(busy);
+      }
+      if (changed) {
+        const stats = render();
+        if (!busy && (view?.kind === "final" || view?.kind === "predicted") && statusTone !== "error") {
+          describeView(stats);
+        }
+      }
+      if (firstMount) void refresh();
     }
+    const observer = new MutationObserver((records) => {
+      // Ignore our own cells/panel to avoid a render-observe-render feedback loop.
+      if (!records.some((record) => {
+        const target = record.target.nodeType === 1 ? record.target : record.target.parentElement;
+        if (target?.closest?.("." + CELL_CLASS + ", ." + PANEL_CLASS)) return false;
+        if (record.type === "attributes") return true;
+        return [...record.addedNodes, ...record.removedNodes].some((node) =>
+          node.nodeType === 1 && !node.classList.contains(CELL_CLASS) && !node.classList.contains(PANEL_CLASS));
+      })) return;
+      clearTimeout(scheduledMount);
+      scheduledMount = setTimeout(mount, 100);
+    });
+    function onVisibilityChange() {
+      if (document.hidden) { clearTimeout(timer); timer = null; }
+      else {
+        mount();
+        if (!busy && view?.kind !== "final") void refresh();
+      }
+    }
+    function stop() {
+      stopped = true;
+      clearTimeout(timer);
+      clearTimeout(scheduledMount);
+      observer.disconnect();
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    }
+    observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["href"] });
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    window.addEventListener("pagehide", (event) => { if (!event.persisted) stop(); });
+    mount();
   }
 
-  void main();
+  start();
 
 })();
